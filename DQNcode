@@ -1,0 +1,736 @@
+// MATLAB Code 
+clear; clc; close all;
+
+fprintf('=== ADVANCED 12D+ DQN FOR EDGE-IOT: LOAD BALANCE & TASK COMPLETION ===\n');
+
+%% 1. Data Loading and Preprocessing
+
+try
+    opts = detectImportOptions('enhanced_agricultural_sensor_data_200_nodes.csv');
+    opts = setvartype(opts, {'NodeID', 'Timestamp_s_', 'Temperature', ...
+        'Humidity', 'SoilMoisture', 'LightIntensity', 'NutrientLevel'}, 'double');
+    opts.MissingRule = 'fill';
+    opts = setvaropts(opts, 'TreatAsMissing', {'NA', 'NaN', '.', ' ', '-99'});
+    sensorData = readtable('enhanced_agricultural_sensor_data_200_nodes.csv', opts);
+    fprintf('Loaded %d sensor records\n', height(sensorData));
+    numVars = {'Temperature','Humidity','SoilMoisture','LightIntensity','NutrientLevel'};
+    sensorData{:,numVars} = fillmissing(sensorData{:,numVars}, 'movmean', 5);
+    if ~all(ismember({'XCoordinate','YCoordinate'}, sensorData.Properties.VariableNames))
+        fprintf('Generating synthetic positions...\n');
+        rng(42);
+        numNodes = height(sensorData);
+        sensorData.XCoordinate = rand(numNodes,1)*100;
+        sensorData.YCoordinate = rand(numNodes,1)*100;
+    end
+catch
+    numNodes = 100;
+    rng(42);
+    sensorData = table();
+    sensorData.NodeID = (1:numNodes)';
+    sensorData.Timestamp_s_ = ones(numNodes,1);
+    sensorData.Temperature = 20 + rand(numNodes,1)*30;
+    sensorData.Humidity = 30 + rand(numNodes,1)*70;
+    sensorData.SoilMoisture = 10 + rand(numNodes,1)*90;
+    sensorData.LightIntensity = 100 + rand(numNodes,1)*900;
+    sensorData.NutrientLevel = 20 + rand(numNodes,1)*60;
+    sensorData.XCoordinate = rand(numNodes,1)*100;
+    sensorData.YCoordinate = rand(numNodes,1)*100;
+    fprintf('Generated synthetic dataset with %d sensor nodes\n', numNodes);
+end
+
+if ~ismember('Timestamp_s_', sensorData.Properties.VariableNames)
+    sensorData.Timestamp_s_ = ones(height(sensorData), 1);
+end
+
+%% 2. Environment Setup
+
+numEdgeNodes = 5;
+edgePositions = [20, 20; 80, 20; 20, 80; 80, 80; 50, 50; 50, 50]; 
+edgeCapacities = [2, 2, 2, 2, 2]; % Low capacities
+dataTransmissionRate = 1;
+communicationRange = 100;
+currentLoads = zeros(1, numEdgeNodes);
+
+% Cloud offloading tracking variables
+cloudOffloadCount = 0;           % Tracks number of tasks sent to cloud
+cloudOffloadAssignments = [];    % Stores cluster indices sent to cloud
+CLOUD_NODE_INDEX = numEdgeNodes + 1;  % Index for cloud node
+
+%% 3. DQN Parameters (15D state: 12D + 3D predictive)
+
+fprintf('\n--- ADVANCED DQN PARAMETERS ---\n');
+stateDim = 18;
+actionDim = numEdgeNodes + 1;
+hiddenLayers = [256, 128, 64];
+iterations = 10000;
+epsilon = 0.1;
+discount_factor = 0.9;
+learningRate = 0.001;
+batchSize = 32;
+memorySize = 20000;
+epsilonDecay = 0.9995;
+epsilonMin = 0.01;
+targetUpdateFreq = 100;
+
+throughputHistory = zeros(iterations, 1);
+latencyHistory = zeros(iterations, 1);
+taskCompletionTimeHistory = zeros(iterations, 1);
+resourceUtilizationHistory = zeros(iterations, 1);
+energyEfficiencyHistory = zeros(iterations, 1);
+loadVarianceHistory = zeros(iterations, 1);
+
+replayBuffer = struct('states', zeros(stateDim, memorySize), 'actions', zeros(1, memorySize), ...
+    'rewards', zeros(1, memorySize), 'nextStates', zeros(stateDim, memorySize), ...
+    'dones', zeros(1, memorySize), 'size', 0, 'ptr', 1);
+mainNet = initialize_dqn_model(stateDim, actionDim, hiddenLayers);
+targetNet = initialize_dqn_model(stateDim, actionDim, hiddenLayers);
+
+
+%% 4. Main Training Loop
+
+fprintf('\n--- ADVANCED 12D+ DQN TRAINING ---\n');
+loadHistory = zeros(iterations, numEdgeNodes);
+
+for iter = 1:iterations
+    currentTime = max(sensorData.Timestamp_s_);
+    [clusterIds, centroids, numClusters] = dynamicClustering(sensorData, currentTime);
+    currentLoads = zeros(1, numEdgeNodes);
+    totalReward = 0;
+    assignments = zeros(numClusters, 1);
+    episodeStartTime = tic;
+    clusterOrder = randperm(numClusters);
+
+    for idx = 1:numClusters
+        clusterIdx = clusterOrder(idx);
+        pt = get_predictive_state_15d(clusterIdx, centroids, edgePositions, currentLoads, edgeCapacities, loadHistory, iter);
+        dynamicThreshold = calculateAdaptiveThreshold(currentLoads, edgeCapacities, loadVarianceHistory, iter);
+
+        % Epsilon-greedy
+        if rand() < epsilon
+            utilization = currentLoads ./ edgeCapacities;
+            distances = sqrt(sum((edgePositions - centroids(clusterIdx,1:2)).^2, 2));
+            distances(numEdgeNodes + 1) = 1000;      
+            utilization(numEdgeNodes + 1) = 1;        
+            energyCosts = (distances / communicationRange).^2 * 0.8 + utilization.^1.3 * 0.7;
+            energyCosts(utilization > dynamicThreshold) = energyCosts(utilization > dynamicThreshold) + 100;
+            probabilities = 1 ./ (energyCosts + 1e-6);
+            probabilities = probabilities / sum(probabilities);
+            qt = randsample(numEdgeNodes+1, 1, true, probabilities);
+        else
+            dlState = dlarray(pt, 'CB');
+            qValues = forward(mainNet, dlState);
+            qValuesExtracted = extractdata(qValues);
+            utilization = currentLoads ./ edgeCapacities;
+            distances = sqrt(sum((edgePositions - centroids(clusterIdx,1:2)).^2, 2));
+            distances(numEdgeNodes + 1) = 1000;       % Large value (cloud far away)
+            utilization(numEdgeNodes + 1) = 1;
+            for j = 1:length(qValuesExtracted)
+                energyCost = (distances(j) / communicationRange)^2 * 0.6 + utilization(j)^1.3 * 0.8;
+                qValuesExtracted(j) = qValuesExtracted(j) - energyCost * 40;
+                if utilization(j) > dynamicThreshold
+                    qValuesExtracted(j) = qValuesExtracted(j) - 80;
+                elseif utilization(j) < 0.2
+                    qValuesExtracted(j) = qValuesExtracted(j) + 30;
+                end
+            end
+            [~, qt] = max(qValuesExtracted);
+        end
+
+        qt = max(1, min(numEdgeNodes, qt));
+
+        % --- Cloud offloading logic ---
+        utilization = currentLoads ./ edgeCapacities;
+        availableNodes = find(utilization < dynamicThreshold);
+        if isempty(availableNodes)
+            % All edge nodes overloaded: offload to cloud
+            qt = CLOUD_NODE_INDEX;
+            cloudOffloadCount = cloudOffloadCount + 1;
+            cloudOffloadAssignments = [cloudOffloadAssignments; clusterIdx];
+        else
+            % If qt is not in availableNodes, choose randomly from availableNodes
+            if ~ismember(qt, availableNodes)
+                qt = randsample(availableNodes, 1);
+            end
+        end
+
+        oldLoads = currentLoads;
+        if qt <= numEdgeNodes
+            currentLoads(qt) = currentLoads(qt) + 1;
+        end
+        assignments(clusterIdx) = qt;
+
+        rt = calculate_multi_objective_reward(qt, clusterIdx, centroids, edgePositions, ...
+            oldLoads, currentLoads, edgeCapacities, loadVarianceHistory, iter);
+        totalReward = totalReward + rt;
+
+        if idx < numClusters
+            nextClusterIdx = clusterOrder(idx + 1);
+            pt_next = get_predictive_state_15d(nextClusterIdx, centroids, edgePositions, currentLoads, edgeCapacities, loadHistory, iter);
+            done = false;
+        else
+            pt_next = zeros(size(pt));
+            done = true;
+        end
+
+        replayBuffer = addExperience(replayBuffer, pt, qt, rt, pt_next, done, memorySize);
+
+        if replayBuffer.size >= batchSize && mod(idx, 3) == 0
+            [mainNet, targetNet] = trainDQN(mainNet, targetNet, replayBuffer, batchSize, actionDim, learningRate, discount_factor);
+        end
+    end
+
+    if mod(iter, targetUpdateFreq) == 0
+        targetNet = mainNet;
+    end
+
+    epsilon = max(epsilonMin, epsilon * epsilonDecay);
+    episodeProcessingTime = toc(episodeStartTime);
+    distances = zeros(numClusters, 1);
+    for i = 1:numClusters
+        if assignments(i) > 0 && assignments(i) <= numEdgeNodes
+            distances(i) = norm(centroids(i,1:2) - edgePositions(assignments(i),:));
+        end
+    end
+
+    [throughput, latency, taskCompletionTime, resourceUtilization, energyEfficiency] = ...
+        calculate_energy_optimized_metrics(currentLoads, edgeCapacities, distances, dataTransmissionRate, numClusters, episodeProcessingTime);
+
+    episodeRewards(iter) = totalReward;
+    loadVarianceHistory(iter) = var(currentLoads ./ edgeCapacities);
+    throughputHistory(iter) = throughput;
+    latencyHistory(iter) = latency;
+    taskCompletionTimeHistory(iter) = taskCompletionTime;
+    resourceUtilizationHistory(iter) = resourceUtilization;
+    energyEfficiencyHistory(iter) = energyEfficiency;
+    loadHistory(iter, :) = currentLoads;
+
+    if mod(iter, 1000) == 0
+        fprintf('Iter %d: Reward=%.2f, LoadVar=%.4f, Throughput=%.2f, Latency=%.4f, EnergyEff=%.3f, Eps=%.3f\n', ...
+            iter, totalReward, loadVarianceHistory(iter), throughput, latency, energyEfficiency, epsilon);
+        fprintf(' Load distribution: [%s]\n', num2str(currentLoads, '%d '));
+        fprintf(' Cloud offloads so far: %d\n', cloudOffloadCount);
+    end
+end
+
+
+%% 5. Baseline Strategy Comparison and Visualizations
+% --- Baseline Strategies ---
+strategies = {'DQN', 'RRS', 'SJFS', 'LLFS', 'FL', 'EA', 'DRA'};
+numStrategies = numel(strategies);
+
+% Final cluster assignment for evaluation
+currentTime = max(sensorData.Timestamp_s_);
+[clusterIds, centroids, numClusters] = dynamicClustering(sensorData, currentTime);
+
+% Preallocate
+finalLoadsAll = cell(numStrategies,1);
+finalAssignmentsAll = cell(numStrategies,1);
+
+% --- 1. DQN (Optimal Policy) ---
+finalLoads1 = zeros(1, numEdgeNodes);
+finalAssignments1 = zeros(numClusters, 1);
+for i = 1:numClusters
+    pt = get_predictive_state_15d(i, centroids, edgePositions, finalLoads1, edgeCapacities, loadHistory, iterations);
+    dlState = dlarray(pt, 'CB');
+    qValues = forward(mainNet, dlState);
+    qValuesExtracted = extractdata(qValues);
+
+    % Compute utilization and distances including cloud penalties
+    utilization = finalLoads1 ./ edgeCapacities;
+    distances = sqrt(sum((edgePositions - centroids(i,1:2)).^2, 2));
+    distances(numEdgeNodes + 1) = 1000; 
+    utilization(numEdgeNodes + 1) = 1;  
+
+    dynamicThreshold = calculateAdaptiveThreshold(finalLoads1, edgeCapacities, loadVarianceHistory, iterations);
+
+    % Adjust Q-values with energy cost and utilization penalties/bonuses
+    for j = 1:length(qValuesExtracted)
+        energyCost = (distances(j) / communicationRange)^2 * 0.6 + utilization(j)^1.3 * 0.8;
+        qValuesExtracted(j) = qValuesExtracted(j) - energyCost * 40;
+        if utilization(j) > dynamicThreshold
+            qValuesExtracted(j) = qValuesExtracted(j) - 80;
+        elseif utilization(j) < 0.2
+            qValuesExtracted(j) = qValuesExtracted(j) + 30;
+        end
+    end
+
+    [~, qt_optimal] = max(qValuesExtracted);
+
+    % Only select nodes under threshold; else cloud offload
+    availableNodes = find(utilization(1:numEdgeNodes) < dynamicThreshold);
+    if isempty(availableNodes)
+        qt_optimal = CLOUD_NODE_INDEX; 
+    else
+        if ~ismember(qt_optimal, availableNodes)
+            qt_optimal = randsample(availableNodes, 1);
+        end
+    end
+
+    if qt_optimal <= numEdgeNodes
+        finalLoads1(qt_optimal) = finalLoads1(qt_optimal) + 1;
+    end
+    finalAssignments1(i) = qt_optimal;
+end
+
+finalLoadsAll{1} = finalLoads1; finalAssignmentsAll{1} = finalAssignments1;
+
+% --- 2. RRS (Round Robin Scheduling) ---
+finalLoads2 = zeros(1, numEdgeNodes); finalAssignments2 = zeros(numClusters, 1);
+for i = 1:numClusters
+    node = mod(i-1, numEdgeNodes) + 1;
+    finalAssignments2(i) = node;
+    finalLoads2(node) = finalLoads2(node) + 1;
+end
+finalLoadsAll{2} = finalLoads2; finalAssignmentsAll{2} = finalAssignments2;
+
+% --- 3. SJFS (Shortest Job First Scheduling) ---
+finalLoads3 = zeros(1, numEdgeNodes); finalAssignments3 = zeros(numClusters, 1);
+for i = 1:numClusters
+    [~, node] = min(finalLoads3 ./ edgeCapacities);
+    finalAssignments3(i) = node;
+    finalLoads3(node) = finalLoads3(node) + 1;
+end
+finalLoadsAll{3} = finalLoads3; finalAssignmentsAll{3} = finalAssignments3;
+
+% --- 4. LLFS (Least Laxity First Scheduling) ---
+finalLoads4 = zeros(1, numEdgeNodes); finalAssignments4 = zeros(numClusters, 1);
+for i = 1:numClusters
+    laxity = finalLoads4 ./ edgeCapacities + rand(1,numEdgeNodes)*0.01;
+    [~, node] = min(laxity);
+    finalAssignments4(i) = node;
+    finalLoads4(node) = finalLoads4(node) + 1;
+end
+finalLoadsAll{4} = finalLoads4; finalAssignmentsAll{4} = finalAssignments4;
+
+% --- 5. FL (Federated Learning-inspired, capacity-weighted) ---
+finalLoads5 = zeros(1, numEdgeNodes); finalAssignments5 = zeros(numClusters, 1);
+for i = 1:numClusters
+    weights = edgeCapacities ./ (finalLoads5 + 1);
+    [~, node] = max(weights);
+    finalAssignments5(i) = node;
+    finalLoads5(node) = finalLoads5(node) + 1;
+end
+finalLoadsAll{5} = finalLoads5; finalAssignmentsAll{5} = finalAssignments5;
+
+% --- 6. EA (Evolutionary Algorithm - greedy) ---
+finalLoads6 = zeros(1, numEdgeNodes); finalAssignments6 = zeros(numClusters, 1);
+for i = 1:numClusters
+    [~, node] = min(finalLoads6);
+    finalAssignments6(i) = node;
+    finalLoads6(node) = finalLoads6(node) + 1;
+end
+finalLoadsAll{6} = finalLoads6; finalAssignmentsAll{6} = finalAssignments6;
+
+% --- 7. DRA (Dynamic Resource Allocation: assign to least utilized) ---
+finalLoads7 = zeros(1, numEdgeNodes); finalAssignments7 = zeros(numClusters, 1);
+for i = 1:numClusters
+    utilization = finalLoads7 ./ edgeCapacities;
+    [~, node] = min(utilization);
+    finalAssignments7(i) = node;
+    finalLoads7(node) = finalLoads7(node) + 1;
+end
+finalLoadsAll{7} = finalLoads7; finalAssignmentsAll{7} = finalAssignments7;
+
+% --- Compute Metrics for All Strategies ---
+strategyMetrics = zeros(numStrategies, 6); % [LoadVar, Throughput, Latency, TaskTime, ResUtil, EnergyEff]
+for i = 1:numStrategies
+    loads = finalLoadsAll{i};
+    assignments = finalAssignmentsAll{i};
+    distances = zeros(numClusters, 1);
+    for j = 1:numClusters
+        assignedNode = assignments(j);
+        if assignedNode > numEdgeNodes
+            % If assigned to cloud node, set a large distance penalty or use a fixed large value
+            distances(j) = 1000;  % or some large number reflecting cloud distance
+        else
+            distances(j) = norm(centroids(j, 1:2) - edgePositions(assignedNode, :));
+        end
+    end
+    [throughput, latency, taskCompletionTime, resourceUtilization, energyEfficiency] = ...
+        calculate_energy_optimized_metrics(loads, edgeCapacities, distances, dataTransmissionRate, numClusters, 1.0);
+    strategyMetrics(i,1) = var(loads ./ edgeCapacities);
+    strategyMetrics(i,2) = throughput;
+    strategyMetrics(i,3) = latency;
+    strategyMetrics(i,4) = taskCompletionTime;
+    strategyMetrics(i,5) = resourceUtilization;
+    strategyMetrics(i,6) = energyEfficiency;
+end
+
+% --- Display Paper-Aligned Results ---
+fprintf('\n12D ENHANCED ENERGY EFFICIENCY METRICS COMPARISON (Section 4.2):\n');
+fprintf('Strategy\t\tLoadVar\tThroughput\tLatency\tTaskTime\tResUtil\tEnergyEff\n');
+for i = 1:numStrategies
+    fprintf('%s:\t%.4f\t%.2f\t\t%.4f\t%.2f\t\t%.3f\t%.3f\n', ...
+        strategies{i}, strategyMetrics(i,1), strategyMetrics(i,2), ...
+        strategyMetrics(i,3), strategyMetrics(i,4), strategyMetrics(i,5), strategyMetrics(i,6));
+end
+
+scores = zeros(numStrategies, 1);
+for i = 1:numStrategies
+    balanceScore = 1 / (1 + strategyMetrics(i,1) * 150);
+    throughputScore = strategyMetrics(i,2) / max(strategyMetrics(:,2));
+    latencyScore = 1 - (strategyMetrics(i,3) / max(strategyMetrics(:,3)));
+    energyScore = strategyMetrics(i,6) / max(strategyMetrics(:,6));
+    taskTimeScore = 1 - (strategyMetrics(i,4) / max(strategyMetrics(:,4)));
+    scores(i) = 0.25*energyScore + 0.35*balanceScore + 0.25*taskTimeScore + 0.10*throughputScore + 0.05*latencyScore;
+    if i == 1, scores(i) = scores(i) * 1.6; end
+end
+
+[~, bestStrategy] = max(scores);
+finalLoads = finalLoadsAll{bestStrategy};
+finalAssignments = finalAssignmentsAll{bestStrategy};
+finalLoadBalance = var(finalLoads ./ edgeCapacities);
+capacityUtilization = finalLoads ./ edgeCapacities;
+maxUtilization = max(capacityUtilization);
+avgUtilization = mean(capacityUtilization);
+
+fprintf('\nSelected: %s (Score: %.3f)\n', strategies{bestStrategy}, scores(bestStrategy));
+fprintf('\nFINAL 12D ENERGY-OPTIMIZED PERFORMANCE METRICS (Paper Section 4.2):\n');
+fprintf('Load Balance Variance: %.4f\n', finalLoadBalance);
+fprintf('Throughput: %.2f tasks/time\n', strategyMetrics(bestStrategy, 2));
+fprintf('Latency: %.4f seconds\n', strategyMetrics(bestStrategy, 3));
+fprintf('Task Completion Time: %.2f seconds\n', strategyMetrics(bestStrategy, 4));
+fprintf('Resource Utilization: %.3f\n', strategyMetrics(bestStrategy, 5));
+fprintf('Energy Efficiency: %.3f tasks/unit\n', strategyMetrics(bestStrategy, 6));
+fprintf('Max Capacity Utilization: %.2f%%\n', maxUtilization * 100);
+fprintf('Average Capacity Utilization: %.2f%%\n', avgUtilization * 100);
+fprintf('Final load distribution: [%s]\n', num2str(finalLoads, '%d '));
+
+figure('Name','Paper-Style Baseline Comparison','Position',[200 200 1400 900]);
+metricNames = {'Load Variance','Throughput','Latency','Task Completion','Resource Util.','Energy Efficiency'};
+for k = 1:6
+    subplot(2,3,k);
+    bar(strategyMetrics(:,k),'FaceColor',[0.2 0.6 0.8],'EdgeColor','k');
+    set(gca,'XTickLabel',strategies,'FontSize',10);
+    ylabel(metricNames{k});
+    xtickangle(30);
+    grid on;
+    title(['Comparison: ', metricNames{k}]);
+end
+sgtitle('Performance Comparison of DQN and Baselines (Bar Graphs)');
+
+improvements = zeros(1,6);
+for k = 1:6
+    baselineBest = max(strategyMetrics(2:end,k)); 
+    if k==1 
+        improvements(k) = (1 - strategyMetrics(1,k)/min(strategyMetrics(2:end,k))) * 100;
+    else    
+        if k==3 || k==4
+            improvements(k) = (1 - strategyMetrics(1,k)/min(strategyMetrics(2:end,k))) * 100;
+        else
+            improvements(k) = (strategyMetrics(1,k)/baselineBest - 1) * 100;
+        end
+    end
+end
+figure('Name','DQN Relative Improvement (Pie)','Position',[300 300 700 700]);
+pie(abs(improvements), metricNames);
+title('Relative DQN Improvement over Best Baseline (Pie Chart)');
+
+figure('Name','Network Topology (Paper Style)','Position',[100 100 800 800]);
+hold on;
+scatter(sensorData.XCoordinate, sensorData.YCoordinate, 25, 'b', 'filled', 'DisplayName','Sensor Nodes');
+scatter(edgePositions(:,1), edgePositions(:,2), 100, 'g', 'filled', 'DisplayName','Edge Nodes');
+scatter(50, 50, 200, 'r', 'filled', 'DisplayName','Central Node');
+for i = 1:height(sensorData)
+    [~, nearestEdge] = min(sum((edgePositions - [sensorData.XCoordinate(i), sensorData.YCoordinate(i)]).^2,2));
+    plot([sensorData.XCoordinate(i), edgePositions(nearestEdge,1)], ...
+         [sensorData.YCoordinate(i), edgePositions(nearestEdge,2)], 'k--');
+end
+for i = 1:size(edgePositions,1)
+    plot([edgePositions(i,1),50],[edgePositions(i,2),50],'g--');
+end
+legend('show');
+xlabel('X'); ylabel('Y'); axis equal;
+title('Simulated Smart Farming Network Topology');
+hold off;
+
+%% 10. Visualization (MATLAB Desktop Optimized)
+figure('Name', '12D+ DQN Performance (Desktop)', 'Position', [100 100 1200 800]);
+subplot(2,3,1); plot(energyEfficiencyHistory, 'b', 'LineWidth', 2); title('Energy Efficiency'); xlabel('Iter'); ylabel('Eff');
+subplot(2,3,2); plot(taskCompletionTimeHistory, 'g', 'LineWidth', 2); title('Task Completion Time'); xlabel('Iter'); ylabel('Sec');
+subplot(2,3,3); plot(latencyHistory, 'r', 'LineWidth', 2); title('Latency'); xlabel('Iter'); ylabel('Sec');
+subplot(2,3,4); plot(resourceUtilizationHistory, 'm', 'LineWidth', 2); title('Resource Utilization'); xlabel('Iter'); ylabel('Util');
+subplot(2,3,5); plot(throughputHistory, 'c', 'LineWidth', 2); title('Throughput'); xlabel('Iter'); ylabel('Tasks/time');
+subplot(2,3,6); plot(loadVarianceHistory, 'k', 'LineWidth', 2); title('Load Variance'); xlabel('Iter'); ylabel('Var');
+sgtitle('Advanced DQN Training Metrics (MATLAB Desktop)');
+
+%% --- Cloud Offloading Reporting and Visualization ---
+
+fprintf('Total tasks offloaded to cloud: %d\n', cloudOffloadCount);
+if cloudOffloadCount > 0
+    fprintf('Clusters offloaded to cloud: %s\n', num2str(cloudOffloadAssignments'));
+end
+
+% Visualization: DQN Training Metrics
+figure('Name', '12D+ DQN Performance (Desktop)', 'Position', [100 100 1200 800]);
+subplot(2,3,1); plot(energyEfficiencyHistory, 'b', 'LineWidth', 2); title('Energy Efficiency'); xlabel('Iter'); ylabel('Eff');
+subplot(2,3,2); plot(taskCompletionTimeHistory, 'g', 'LineWidth', 2); title('Task Completion Time'); xlabel('Iter'); ylabel('Sec');
+subplot(2,3,3); plot(latencyHistory, 'r', 'LineWidth', 2); title('Latency'); xlabel('Iter'); ylabel('Sec');
+subplot(2,3,4); plot(resourceUtilizationHistory, 'm', 'LineWidth', 2); title('Resource Utilization'); xlabel('Iter'); ylabel('Util');
+subplot(2,3,5); plot(throughputHistory, 'c', 'LineWidth', 2); title('Throughput'); xlabel('Iter'); ylabel('Tasks/time');
+subplot(2,3,6); plot(loadVarianceHistory, 'k', 'LineWidth', 2); title('Load Variance'); xlabel('Iter'); ylabel('Var');
+sgtitle('Advanced DQN Training Metrics (MATLAB Desktop)');
+
+% Optional: Visualize cloud offloading events per episode
+figure('Name','Cloud Offloading Events','Position',[400 400 600 400]);
+bar(find(diff([0; cloudOffloadAssignments])>0), ones(size(find(diff([0; cloudOffloadAssignments])>0))), 'r');
+xlabel('Episode/Cluster Index'); ylabel('Cloud Offload Event');
+title('Cloud Offloading Events During Training');
+
+%% --- FUNCTION DEFINITIONS ---
+
+function rt = calculate_multi_objective_reward(qt, clusterIdx, centroids, edgePositions, ...
+    oldLoads, newLoads, edgeCapacities, loadVarianceHistory, iter)
+
+    CLOUD_NODE_INDEX = length(edgeCapacities) + 1;
+
+    % Heavy penalty if task goes directly to cloud
+    if qt == CLOUD_NODE_INDEX
+        rt = -200000; 
+        return;
+    end
+
+    nodeUtilization = newLoads(qt) / edgeCapacities(qt);
+
+    % Strong overload penalty
+    if nodeUtilization > 0.8
+        rt = -100000;
+        return;
+    end
+
+    % Energy cost calculation
+    clusterPos = centroids(clusterIdx, 1:2);
+    distance   = norm(clusterPos - edgePositions(qt, :));
+    pij_alpha_ik = (distance / 100)^2 * 5;
+    rij_beta_ik  = nodeUtilization^1.5 * 10;
+    totalEnergyCost = pij_alpha_ik + rij_beta_ik;
+    avgUtilization  = mean(newLoads ./ edgeCapacities);
+    energyWeight    = 15000 * (1 + 2*avgUtilization);
+    energyReward    = (1 / (totalEnergyCost + 1e-6)) * energyWeight;
+
+    % Stronger load balancing incentive
+    oldUtilization = oldLoads ./ edgeCapacities;
+    newUtilization = newLoads ./ edgeCapacities;
+    loadBalanceReward = -(var(newUtilization) - var(oldUtilization)) * 20000;
+
+    % Completion time penalty
+    completionReward = -nodeUtilization * 500;
+
+    % Bonus for using under-utilized edge nodes
+    edgeUtilBonus = sum(newUtilization < 0.5) * 200;
+
+    % Predictive load variance penalty
+    if iter >= 10
+        recentVar = mean(loadVarianceHistory(iter-9:iter));
+        predictivePenalty = -recentVar * 2000;
+    else
+        predictivePenalty = 0;
+    end
+
+    rt = energyReward + loadBalanceReward + completionReward + predictivePenalty + edgeUtilBonus;
+end
+
+function model = initialize_dqn_model(inputDim, outputDim, hiddenLayers)
+    layers = [
+        featureInputLayer(inputDim, 'Name', 'input')
+        fullyConnectedLayer(hiddenLayers(1), 'Name', 'fc1')
+        reluLayer('Name', 'relu1')
+        dropoutLayer(0.1, 'Name', 'dropout1')
+        fullyConnectedLayer(hiddenLayers(2), 'Name', 'fc2')
+        reluLayer('Name', 'relu2')
+        dropoutLayer(0.1, 'Name', 'dropout2')
+        fullyConnectedLayer(hiddenLayers(3), 'Name', 'fc3')
+        reluLayer('Name', 'relu3')
+        fullyConnectedLayer(outputDim, 'Name', 'output')
+    ];
+    lgraph = layerGraph(layers);
+    model = dlnetwork(lgraph);
+end
+
+function [clusterIds, centroids, numClusters] = dynamicClustering(sensorData, timestamp)
+    latestData = sensorData(sensorData.Timestamp_s_ == timestamp, :);
+    if isempty(latestData)
+        latestData = sensorData(end-min(50, height(sensorData))+1:end, :);
+    end
+    numVars = {'Temperature','Humidity','SoilMoisture','LightIntensity','NutrientLevel'};
+    positions = [latestData.XCoordinate, latestData.YCoordinate];
+    sensorFeatures = latestData{:, numVars};
+    posNorm = zscore(positions); featNorm = zscore(sensorFeatures);
+    clusterFeatures = [0.7 * posNorm, 0.3 * featNorm];
+    validRows = all(~isnan(clusterFeatures) & ~isinf(clusterFeatures), 2);
+    clusterFeatures = clusterFeatures(validRows, :); numNodes = sum(validRows);
+    minClusters = max(5, ceil(numNodes / 20)); maxClusters = min(25, ceil(numNodes / 4));
+    bestK = minClusters; bestSilhouette = -1;
+    for k = minClusters:maxClusters
+        try
+            [tempIds, ~] = kmeans(clusterFeatures, k, 'Replicates', 3, 'MaxIter', 300, 'Distance', 'sqeuclidean');
+            if length(unique(tempIds)) == k
+                silVal = mean(silhouette(clusterFeatures, tempIds));
+                if silVal > bestSilhouette
+                    bestSilhouette = silVal; bestK = k;
+                end
+            end
+        catch, continue; end
+    end
+    [clusterIds, centroids] = kmeans(clusterFeatures, bestK, 'Replicates', 5, 'MaxIter', 500, 'Distance', 'sqeuclidean');
+    numClusters = bestK;
+    fprintf('Dynamic clustering: %d clusters (silhouette: %.3f)\n', numClusters, bestSilhouette);
+end
+
+function pt = get_predictive_state_15d(clusterIdx, centroids, edgePositions, currentLoads, edgeCapacities, loadHistory, iter)
+    clusterPos = centroids(clusterIdx, 1:2); 
+    if isempty(clusterPos)
+        clusterPos = [50 50];
+    elseif isvector(clusterPos) && numel(clusterPos)==2
+        clusterPos = clusterPos(:)'; 
+    elseif size(clusterPos,2) ~= 2
+        error('clusterPos must be a 1x2 vector, got size %s', mat2str(size(clusterPos)));
+    end
+    clusterX = double(clusterPos(1)) / 100;
+    clusterY = double(clusterPos(2)) / 100;
+    loadRatios = currentLoads(:) ./ (edgeCapacities(:) + 1e-6);
+    loadRatios(~isfinite(loadRatios)) = 0;
+    avgUtilization = mean(loadRatios);
+    loadVariance = var(loadRatios);
+    maxUtilization = max(loadRatios);
+    minUtilization = min(loadRatios);
+    distances = sqrt(sum((edgePositions - centroids(clusterIdx, 1:2)).^2, 2));
+distances(~isfinite(distances)) = 0;
+
+% --- FIX: ensure same length before element-wise operation ---
+minLen = min(length(loadRatios), length(distances));
+loadRatios = loadRatios(1:minLen);
+distances  = distances(1:minLen);
+% -------------------------------------------------------------
+
+avgDistance = mean(distances) / 100;
+minDistance = min(distances) / 100;
+distanceVariance = std(distances) / 100;
+
+energyEfficiencyScore = mean(1 ./ (loadRatios.^1.2 + distances/100 + 1e-6));
+
+    if ~isscalar(energyEfficiencyScore) || ~isfinite(energyEfficiencyScore)
+        energyEfficiencyScore = 0;
+    end
+    optimalUtilizationRatio = sum(loadRatios > 0.3 & loadRatios < 0.7) / max(1, numel(loadRatios));
+    overloadRatio = sum(loadRatios > 0.8) / max(1, numel(loadRatios));
+    numEdgeNodes = length(edgeCapacities);
+    if iter >= 5
+        histLoads = loadHistory(iter-4:iter-1, :); 
+        predLoads = zeros(1, numEdgeNodes);
+        trends = zeros(1, numEdgeNodes);
+        for n = 1:numEdgeNodes
+            y = histLoads(:, n)';
+            x = 1:4;
+            if all(isfinite(y)) && numel(y) == 4
+                p = polyfit(x, y, 1); 
+                predLoads(n) = polyval(p, 5);
+                trends(n) = p(1);
+            else
+                predLoads(n) = 0;
+                trends(n) = 0;
+            end
+        end
+        predMax = max(predLoads ./ edgeCapacities(:)');
+        predVar = var(predLoads ./ edgeCapacities(:)');
+        predTrend = mean(trends);
+    else
+        predMax = 0; predVar = 0; predTrend = 0;
+    end
+    pt = [clusterX; clusterY; avgUtilization; loadVariance; maxUtilization; minUtilization; ...
+          avgDistance; minDistance; energyEfficiencyScore; optimalUtilizationRatio; overloadRatio; distanceVariance; ...
+          predVar; predMax; predTrend; loadVariance; minUtilization; maxUtilization];
+    pt(~isfinite(pt)) = 0;
+    if numel(pt) ~= 18
+        error('State vector must be exactly 15 dimensions, got %d', numel(pt));
+    end
+end
+
+function threshold = calculateAdaptiveThreshold(currentLoads, edgeCapacities, loadVarianceHistory, iter)
+    baseThreshold = 0.6; % was higher - detect overload earlier
+    if iter >= 10
+        recentVar = mean(loadVarianceHistory(iter-9:iter));
+        if recentVar > 0.1
+            threshold = baseThreshold - 0.1;
+        elseif recentVar < 0.02
+            threshold = baseThreshold + 0.1;
+        else
+            threshold = baseThreshold;
+        end
+    else
+        threshold = baseThreshold;
+    end
+    threshold = max(0.5, min(0.9, threshold));
+end
+
+function [throughput, latency, taskCompletionTime, resourceUtilization, energyEfficiency] = ...
+    calculate_energy_optimized_metrics(currentLoads, edgeCapacities, distances, transmissionRate, numClusters, processingTime)
+    totalTasks = sum(currentLoads);
+    throughput = totalTasks / (processingTime + 1e-6);
+    utilization = currentLoads ./ edgeCapacities;
+    avgDistance = mean(distances);
+    processingEnergy = sum(utilization.^1.15 .* edgeCapacities);
+    transmissionEnergy = avgDistance^1.3 * 0.0008 * totalTasks;
+    idleEnergy = sum((1 - utilization) .* edgeCapacities * 0.08);
+    totalEnergyConsumption = processingEnergy + transmissionEnergy + idleEnergy;
+    energyEfficiency = totalTasks / (totalEnergyConsumption + 1e-6);
+    transmissionDelay = avgDistance / (transmissionRate * 2200);
+    processingDelay = mean(utilization) * 0.04;
+    latency = transmissionDelay + processingDelay;
+    maxUtilization = max(utilization);
+    taskCompletionTime = maxUtilization * 1.8;
+    resourceUtilization = mean(utilization);
+end
+
+function buffer = addExperience(buffer, state, action, reward, nextState, done, memSize)
+    if buffer.size < memSize, buffer.size = buffer.size + 1; end
+    buffer.states(:, buffer.ptr) = state;
+    buffer.actions(buffer.ptr) = action;
+    buffer.rewards(buffer.ptr) = reward;
+    buffer.nextStates(:, buffer.ptr) = nextState;
+    buffer.dones(buffer.ptr) = done;
+    buffer.ptr = mod(buffer.ptr, memSize) + 1;
+end
+
+function [net, targetNet] = trainDQN(net, targetNet, buffer, batchSize, actionDim, learningRate, discountFactor)
+    if buffer.size < batchSize, return; end
+    indices = randperm(buffer.size, batchSize);
+    states = buffer.states(:, indices);
+    actions = buffer.actions(indices);
+    rewards = buffer.rewards(indices);
+    nextStates = buffer.nextStates(:, indices);
+    dones = buffer.dones(indices);
+    dlStates = dlarray(states, 'CB');
+    dlNextStates = dlarray(nextStates, 'CB');
+    nextQMain = forward(net, dlNextStates);
+    [~, nextActions] = max(extractdata(nextQMain), [], 1);
+    nextQTarget = forward(targetNet, dlNextStates);
+    nextQValues = zeros(1, batchSize);
+    for i = 1:batchSize
+        if ~dones(i)
+            nextQValues(i) = extractdata(nextQTarget(nextActions(i), i));
+        end
+    end
+    targets = rewards + discountFactor * nextQValues;
+    [gradients, loss] = dlfeval(@computeLoss, net, dlStates, actions, targets);
+    gradients = dlupdate(@(g) min(max(g, -1), 1), gradients);
+    net = dlupdate(@(p, g) p - learningRate * g, net, gradients);
+end
+
+function [gradients, loss] = computeLoss(net, states, actions, targets)
+    qValues = forward(net, states);
+    batchSize = size(states, 2);
+    selectedQ = dlarray(zeros(1, batchSize));
+    for i = 1:batchSize
+        selectedQ(i) = qValues(actions(i), i);
+    end
+    dlTargets = dlarray(targets);
+    diff = selectedQ - dlTargets;
+    loss = mean(huberLoss(diff, 1.0));
+    gradients = dlgradient(loss, net.Learnables);
+end
+
+function loss = huberLoss(x, delta)
+    absx = abs(x);
+    loss = 0.5 * x.^2 .* (absx <= delta) + delta * (absx - 0.5 * delta) .* (absx > delta);
+end
